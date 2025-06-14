@@ -1,14 +1,21 @@
-﻿using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
+﻿using System.Diagnostics;
 using System.IO.Compression;
 using System.Text;
+using NAudio.Midi;
+using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.PixelFormats;
 
 const string divider     = "---------------------------------------";
 const string mainTitle   = "SPINNAKER ADVENTURE LANGUAGE TESTER";
 const string titleDecor  = "**";
 const string goodbye     = "Game over.";
 
-const string exportMenu  = "Export all pictures to PNG";
+const string expTag      = " [experimental]";
+const string switchMenu  = "Switch computer type";
+const string exportPngMenu = "Export all pictures to PNG";
+const string exportMidMenu = "Export all audio to MIDI";
 const string backMenu    = "Back to Main Menu";
 const string quitMenu    = "Quit";
 const string prompt      = "Press number/letter of an option to proceed:";
@@ -18,9 +25,22 @@ const string fileprompt  = "Enter a filename, or press Enter to continue:";
 const string keyError    = "Error: Bad entry.";
 
 const string picMenu     = "View pictures";
-const string sndMenu     = "Audio filenames";
+const string sndMenu     = "Play audio";
 const string strMenu     = "Strings";
 const string strExpMenu  = "Strings (expanded)";
+
+const string apple2Abb   = "AII";
+const string apple2Type  = "Apple II";
+const string atariStAbb  = "AST";
+const string atariStType = "Atari ST";
+const string commodoreAbb = "C64";
+const string commodoreType = "Commodore 64";
+const string ibmAbb      = "IBM";
+const string ibmType     = "IBM PC (default)";
+const string macAbb      = "MAC";
+const string macType     = "Macintosh";
+const string msxAbb      = "MSX";
+const string msxType     = "MSX";
 
 // Amazon
 const string amazonName  = "Amazon";
@@ -91,11 +111,18 @@ var ozTitle = ozName.ToUpperInvariant();
 const string rscPath     = @"Resources";
 
 const byte DELIM = 0x00;
+const byte FIRST_PITCH_BYTE = 0xC2;
+const int FIRST_MIDI = 45;  // A2
+const int LAST_MIDI = 106;  // Bb7
+const int FIRST_OCTAVE = 3; // to nearest C
+const int PATCH = 80;       // "Lead 1 (square)"
 
-const ConsoleKey key1 = ConsoleKey.D1, key2 = ConsoleKey.D2, key3 = ConsoleKey.D3, key4 = ConsoleKey.D4,
-                 key5 = ConsoleKey.D5, key6 = ConsoleKey.D6, key7 = ConsoleKey.D7, key8 = ConsoleKey.D8,
-                 key9 = ConsoleKey.D9, keyExport = ConsoleKey.X, keyBack = ConsoleKey.B, keyQuit = ConsoleKey.Q,
-                 keyEsc = ConsoleKey.Escape;
+const ConsoleKey key0 = ConsoleKey.D0, key1 = ConsoleKey.D1, key2 = ConsoleKey.D2, key3 = ConsoleKey.D3,
+                 key4 = ConsoleKey.D4, key5 = ConsoleKey.D5, key6 = ConsoleKey.D6, key7 = ConsoleKey.D7,
+                 key8 = ConsoleKey.D8, key9 = ConsoleKey.D9, keySwitch = ConsoleKey.S, keyExpPng = ConsoleKey.P,
+                 keyExpMid = ConsoleKey.M, keyBack = ConsoleKey.B, keyQuit = ConsoleKey.Q, keyEsc = ConsoleKey.Escape;
+
+var pcType = "IBM";
 
 List<string> addlStrFiles =
 [
@@ -115,7 +142,7 @@ try
     if (File.Exists(zipfile))
     {
         Console.WriteLine("Extracting Resources.zip ...");
-        ZipFile.ExtractToDirectory(zipfile, rscPath, overwriteFiles: true);
+        ZipFile.ExtractToDirectory(zipfile, rscPath, overwriteFiles: false);
     }
 }
 catch (Exception) { }
@@ -146,13 +173,17 @@ void ShowFunctions(string abbrev)
     const byte OFFSET = 0x06;
     byte[] funcEnd = [0x00, 0x00, 0x00];
     ushort i = 0;
-    var funcPath = Path.Combine(rscPath, abbrev, abbrev + ".T");
+    var funcPath = Path.Combine(rscPath, abbrev + pcType, abbrev + ".T");
     try
     {
         if (!File.Exists(funcPath))
         {
-            Console.Error.WriteLine("Error: File not found!");
-            return;
+            Console.Error.WriteLine($"Error: File not found: {funcPath}");
+            funcPath = Path.Combine(rscPath, abbrev, abbrev + ".T");
+            if (!File.Exists(funcPath))
+            {
+                return;
+            }
         }
         var t = File.ReadAllBytes(funcPath);
         if (t.Length < (OFFSET + 1))
@@ -181,13 +212,17 @@ void ShowVocab(string abbrev)
     const byte OFFSET = 0x3C;
     byte[] vDelim = [0x80, 0x8C]; // This represents the part of speech, but acts as delimiter as well here
     ushort i = 0;
-    var vocabPath = Path.Combine(rscPath, abbrev, abbrev + ".V");
+    var vocabPath = Path.Combine(rscPath, abbrev + pcType, abbrev + ".V");
     try
     {
         if (!File.Exists(vocabPath))
         {
-            Console.Error.WriteLine("Error: File not found!");
-            return;
+            Console.Error.WriteLine($"Error: File not found: {vocabPath}");
+            vocabPath = Path.Combine(rscPath, abbrev, abbrev + ".V");
+            if (!File.Exists(vocabPath))
+            {
+                return;
+            }
         }
         var vocab = File.ReadAllBytes(vocabPath);
         foreach (var word in Split(vocab[OFFSET..], vDelim, range: true))
@@ -206,11 +241,15 @@ void ShowVocab(string abbrev)
 
 void ShowPicFiles(string abbrev)
 {
+    var fileFound = false;
     Console.WriteLine(picWarn);
     foreach (var file in GetPicFiles(abbrev))
     {
         Console.WriteLine(file);
+        fileFound = true;
     }
+    if (!fileFound)
+        return;
     var input = "";
     do
     {
@@ -218,15 +257,17 @@ void ShowPicFiles(string abbrev)
         input = Console.ReadLine();
         if (!string.IsNullOrEmpty(input))
         {
-            var filePath = Path.Combine(rscPath, abbrev, input);
-            try
+            var filePath = Path.Combine(rscPath, abbrev + pcType, input);
+            if (!File.Exists(filePath))
             {
+                filePath = Path.Combine(rscPath, abbrev, input);
                 if (!File.Exists(filePath))
-                    Console.WriteLine("Error: File not found!");
-                else
-                    Draw(abbrev, filePath, toFile: false);
+                {
+                    Console.WriteLine($"Error: File not found: {filePath}");
+                    break;
+                }
             }
-            catch (Exception) { }
+            DrawPic(abbrev, filePath, toFile: false);
         }
         else
             Console.WriteLine(divider);
@@ -236,10 +277,47 @@ void ShowPicFiles(string abbrev)
 
 void ShowSoundFiles(string abbrev)
 {
+    var fileFound = false;
+    Console.WriteLine(divider);
+    Console.WriteLine(" HEX | MIDI |   FREQ   | NOTE");
+    Console.WriteLine(divider);
+    for (int x = FIRST_PITCH_BYTE; x < 0x100; x++)
+    {
+        int midi = x - FIRST_PITCH_BYTE + FIRST_MIDI;
+        Console.WriteLine($"0x{x:x2} | {midi,3}  | {Math.Round(GetFreq(midi), 2),8:n2} | {GetNoteName(midi)}");
+    }
+    Console.WriteLine(divider);
+
     foreach (var file in GetSoundFiles(abbrev))
     {
         Console.WriteLine(file);
+        fileFound = true;
     }
+    if (!fileFound)
+        return;
+    var input = "";
+    do
+    {
+        Console.Write(fileprompt);
+        input = Console.ReadLine();
+        if (!string.IsNullOrEmpty(input))
+        {
+            var filePath = Path.Combine(rscPath, abbrev + pcType, input);
+            if (!File.Exists(filePath))
+            {
+                filePath = Path.Combine(rscPath, abbrev, input);
+                if (!File.Exists(filePath))
+                {
+                    Console.WriteLine($"Error: File not found: {filePath}");
+                    break;
+                }
+            }
+            PlaySound(abbrev, filePath);
+        }
+        else
+            Console.WriteLine(divider);
+    }
+    while (!string.IsNullOrEmpty(input));
 }
 
 void ShowStrings(string abbrev, byte start, bool expand = false)
@@ -251,13 +329,23 @@ void ShowStrings(string abbrev, byte start, bool expand = false)
         var locName = loc.Value.Item2;
         Console.WriteLine(divider);
         Console.WriteLine(locName.ToUpperInvariant());
-        var filePath = Path.Combine(rscPath, abbrev, locName);
+
+        var filePath = Path.Combine(rscPath, abbrev + pcType, locName);
         try
         {
             if (!File.Exists(filePath))
             {
-                Console.WriteLine($"File not found: {filePath}");
-                continue;
+                if (pcType.Equals("MSX") && File.Exists(filePath + ".STR"))
+                    filePath += ".STR";
+                else
+                {
+                    Console.WriteLine($"Error: File not found: {filePath}");
+                    filePath = Path.Combine(rscPath, abbrev, locName);
+                    if (!File.Exists(filePath))
+                    {
+                        continue;
+                    }
+                }
             }
             var i = 0;
             var array = File.ReadAllBytes(filePath);
@@ -297,7 +385,9 @@ void ShowStrings(string abbrev, byte start, bool expand = false)
             var k = Console.ReadKey(intercept: true);
             if (k.Key.Equals(keyEsc) ||
                 k.Key.Equals(keyBack))
+            {
                 break;
+            }
             else if (k.Key.Equals(keyQuit))
                 DoExit();
 
@@ -309,13 +399,19 @@ void ShowStrings(string abbrev, byte start, bool expand = false)
 Dictionary<ushort, string> GetExe(string abbrev, byte[] start, byte[] end)
 {
     Dictionary<ushort, string> exeDict = [];
-    var exePath = Path.Combine(rscPath, abbrev, abbrev + ".EXE");
+    var exePath = Path.Combine(rscPath, abbrev + pcType, abbrev + ".EXE");
+    if (pcType.Equals("MSX"))
+        exePath = Path.Combine(rscPath, abbrev + pcType, "AVENTURA.COM");
     try
     {
         if (!File.Exists(exePath))
         {
-            Console.Error.WriteLine("Error: File not found!");
-            return exeDict;
+            Console.Error.WriteLine($"Error: File not found: {exePath}");
+            exePath = Path.Combine(rscPath, abbrev, abbrev + ".EXE");
+            if (!File.Exists(exePath))
+            {
+                return exeDict;
+            }
         }
         var exe = File.ReadAllBytes(exePath);
         var begin = false;
@@ -335,7 +431,9 @@ Dictionary<ushort, string> GetExe(string abbrev, byte[] start, byte[] end)
             if (!string.IsNullOrEmpty(e) &&
                 !e.Equals("?") &&
                 !e.Contains("??"))
+            {
                 Console.WriteLine($"{e}");
+            }
         }
     }
     catch (Exception) { }
@@ -349,16 +447,32 @@ Dictionary<ushort, (char, string)> GetLocs(string abbrev)
     byte[] locDelim = [0x0D, 0x0A];
     Dictionary<ushort, (char, string)> locs = [];
     ushort i = 0;
-    var locPath = Path.Combine(rscPath, abbrev, "DIR");
-    if (abbrev.Equals("AMB", StringComparison.OrdinalIgnoreCase) ||
-        abbrev.Equals("PMN", StringComparison.OrdinalIgnoreCase))
-        locPath = Path.Combine(rscPath, abbrev, abbrev + ".DIB");
+    if (pcType.Equals("MSX"))
+    {
+        Console.WriteLine("GetLocs(): AVENTURA.COM parsing not yet implemented for MSX");
+        return locs;
+    }
+    var locPath = Path.Combine(rscPath, abbrev + pcType, "DIR");
+    if (abbrev.Equals("AMB") ||
+        abbrev.Equals("PMN"))
+    {
+        locPath = Path.Combine(rscPath, abbrev + pcType, abbrev + ".DIB");
+    }
     try
     {
         if (!File.Exists(locPath))
         {
-            Console.Error.WriteLine("Error: File not found!");
-            return locs;
+            Console.Error.WriteLine($"Error: File not found: {locPath}");
+            locPath = Path.Combine(rscPath, abbrev, abbrev + ".DIB");
+            if (abbrev.Equals("AMB") ||
+                abbrev.Equals("PMN"))
+            {
+                locPath = Path.Combine(rscPath, abbrev, abbrev + ".DIB");
+            }
+            if (!File.Exists(locPath))
+            {
+                return locs;
+            }
         }
         var dir = File.ReadAllBytes(locPath);
         foreach (var loc in Split(dir, locDelim))
@@ -380,13 +494,17 @@ Dictionary<byte, string> GetTokens(string abbrev, int start = 0) // Only necessa
     const int OFFSET = 0x102;
     Dictionary<byte, string> tokens = [];
     byte b = 0x80;
-    var tokenPath = Path.Combine(rscPath, abbrev, abbrev + ".TOK");
+    var tokenPath = Path.Combine(rscPath, abbrev + pcType, abbrev + ".TOK");
     try
     {
         if (!File.Exists(tokenPath))
         {
-            Console.Error.WriteLine("Error: File not found!");
-            return tokens;
+            Console.Error.WriteLine($"Error: File not found: {tokenPath}");
+            tokenPath = Path.Combine(rscPath, abbrev, abbrev + ".TOK");
+            if (!File.Exists(tokenPath))
+            {
+                return tokens;
+            }
         }
         var tok = File.ReadAllBytes(tokenPath);
         if (tok.Length < (OFFSET + 1))
@@ -410,42 +528,65 @@ List<string> GetPicFiles(string abbrev)
     {
         locNames.Add(loc.Value.Item2);
     }
-    foreach (var file in Directory.EnumerateFiles(Path.Combine(rscPath, abbrev), "*.").ToList())
+    try
     {
-        var filename = Path.GetFileName(file);
-        if (!locNames.Contains(filename, StringComparer.OrdinalIgnoreCase) &&
-            !addlStrFiles.Contains(filename, StringComparer.OrdinalIgnoreCase) &&
-            !abbrev.Equals(filename, StringComparison.OrdinalIgnoreCase))
-            picFiles.Add(filename);
+        foreach (var file in Directory.EnumerateFiles(Path.Combine(rscPath, abbrev + pcType), "*.").ToList())
+        {
+            var filename = Path.GetFileName(file);
+            if (!locNames.Contains(filename, StringComparer.OrdinalIgnoreCase) &&
+                !addlStrFiles.Contains(filename, StringComparer.OrdinalIgnoreCase) &&
+                !abbrev.Equals(filename, StringComparison.OrdinalIgnoreCase))
+            {
+                picFiles.Add(filename);
+            }
+        }
     }
+    catch (Exception) { }
     return picFiles;
 }
 
 List<string> GetSoundFiles(string abbrev)
 {
     List<string> sndFiles = [];
-    foreach (var file in Directory.EnumerateFiles(Path.Combine(rscPath, abbrev), "*.IB").ToList())
+    try
     {
-        var filename = Path.GetFileName(file);
-        sndFiles.Add(filename);
+        foreach (var file in Directory.EnumerateFiles(Path.Combine(rscPath, abbrev + pcType), "*.IB").ToList())
+        {
+            var filename = Path.GetFileName(file);
+            sndFiles.Add(filename);
+        }
+        foreach (var file in Directory.EnumerateFiles(Path.Combine(rscPath, abbrev + pcType), "*.JR").ToList())
+        {
+            var filename = Path.GetFileName(file);
+            sndFiles.Add(filename);
+        }
     }
-    foreach (var file in Directory.EnumerateFiles(Path.Combine(rscPath, abbrev), "*.JR").ToList())
-    {
-        var filename = Path.GetFileName(file);
-        sndFiles.Add(filename);
-    }
+    catch (Exception) { }
     return sndFiles;
 }
 
 void ExportPicFiles()
 {
-    Console.WriteLine("Please wait...");
+    Console.WriteLine("Please wait ...");
     foreach (var abbrev in new[] { amazonAbb, dragonAbb, f451Abb, amberAbb, perryAbb, ramaAbb, islandAbb, ozAbb })
     {
         var picFiles = GetPicFiles(abbrev);
         foreach (var file in picFiles)
         {
-            Draw(abbrev, Path.Combine(rscPath, abbrev, file), toFile: true);
+            DrawPic(abbrev, Path.Combine(rscPath, abbrev + pcType, file), toFile: true);
+        }
+    }
+}
+
+void ExportSndFiles()
+{
+    Console.WriteLine("Please wait ...");
+    foreach (var abbrev in new[] { amazonAbb, dragonAbb, f451Abb, amberAbb, perryAbb, ramaAbb, islandAbb, ozAbb })
+    {
+        var sndFiles = GetSoundFiles(abbrev);
+        foreach (var file in sndFiles)
+        {
+            PlaySound(abbrev, Path.Combine(rscPath, abbrev + pcType, file), toFile: true);
         }
     }
 }
@@ -483,6 +624,7 @@ IEnumerable<string> ProcessStrings(byte[] array, Dictionary<byte, string> tokens
 {
     const byte FIRST = 0x0B;
     const byte MIN = 0x7F;
+    bool accent = false;
     MemoryStream stream = new();
     BinaryWriter result = new(stream);
     ushort i = 0;
@@ -513,8 +655,39 @@ IEnumerable<string> ProcessStrings(byte[] array, Dictionary<byte, string> tokens
                     result.Write(Encoding.ASCII.GetBytes(" " + str));
                 continue;
             }
+            else if (b == 0x22) // escape quotation marks
+            {
+                result.Write(Encoding.ASCII.GetBytes("\\\""));
+            }
+            else if (b == 0x7E) // tilde
+                accent = true;
+            else if (accent)
+                accent = false;
+
             n = 0;
-            result.Write(b);
+            var output = b;
+            switch (b)
+            {
+                case 0x61: // a
+                    output = 0xE1;
+                    break;
+                case 0x65: // e
+                    output = 0xE9;
+                    break;
+                case 0x69: // i
+                    output = 0xED;
+                    break;
+                case 0x6E: // n
+                    output = 0xF1;
+                    break;
+                case 0x6F: // o
+                    output = 0xF3;
+                    break;
+                case 0x75: // u
+                    output = 0xFA;
+                    break;
+            }
+            result.Write(output);
         }
         else
             i++;
@@ -650,10 +823,389 @@ ConsoleColor GetCColor(ushort c, ushort palette)
     return color;
 }
 
-// The CGA medium-resolution graphics mode is 320x200 x 4-color, with 2 possible palettes in mode 4;
-void Draw(string abbrev, string filePath = "", bool toFile = false)
+// This implementation is monophonic only, plays each channel one at a time
+// (This one sounds more authentic than MIDI, but the timing doesn't work as well)
+void WaveOut(int delay, List<(int Ch, int Pos, byte B, int Midi, double Freq, int Length)> notes)
 {
-    byte OFFSET = 0x06; // The first 6 bytes have palette colors, some unknown stuff, and height/width
+    var ch = 0;
+    var square = new SignalGenerator()
+    {
+        Gain = 0.1,
+        Type = SignalGeneratorType.Square,
+    };
+    using var wave = new WaveOutEvent();
+    
+    foreach (var note in notes)
+    {
+        var nibble1 = (byte)((note.B & 0xF0) >> 4);
+        var nibble2 = (byte)((note.B & 0x0F) - 1);
+        if (note.B == 0x80)
+            continue;
+
+        var rest = false;
+        var freq = note.Freq;
+        var midi = note.Midi;
+        var len = note.Length;
+        if (nibble1 == 0x8)
+        {
+            rest = true;
+            freq = 0; // set frequency to 0 if this is a rest
+            midi = 0; // set MIDI note to 0 if this is a rest
+        }
+        var lenStr = GetNoteLengthName(len);
+        Console.WriteLine($"{note.Pos:x3} : {note.B:x2} {(len > 0 ? (rest ? "r" : midi > 0 ? GetNoteName(note.Midi) : "") : midi > 0 ? "*" : "")}\t{lenStr}\tFreq:{Math.Round(freq, 2),7}\tMIDI:{midi,3}");
+        // Not polyphonic, play next track separately
+        if (note.Ch != ch)
+        {
+            ch = note.Ch;
+            Console.WriteLine("Channel " + ch);
+        }
+        square.Frequency = freq;
+        wave.Init(square.Take(TimeSpan.FromSeconds(2)));
+        wave.Play();
+        while (wave.PlaybackState == PlaybackState.Playing)
+        {
+            Thread.Sleep(note.Length * delay);
+            wave.Stop();
+            // TODO: Stop on keyboard input
+        }
+    }
+}
+
+// This implementation is monophonic only, plays each channel one at a time
+void MidiOut(int delay, List<(int Ch, int Pos, byte B, int Midi, double Freq, int Length)> notes)
+{
+    var ch = 0;
+    using var midiOut = new MidiOut(0);
+    for (int i = 1; i < 17; i++) // TODO: Why are there sometimes (what I've interpreted to be) more than 3 channels?
+    {
+        midiOut.Send(MidiMessage.ChangePatch(PATCH, i).RawData);
+    }
+
+    foreach (var note in notes)
+    {
+        var nibble1 = (byte)((note.B & 0xF0) >> 4);
+        var nibble2 = (byte)((note.B & 0x0F) - 1);
+
+        var rest = false;
+        var freq = note.Freq;
+        var midi = note.Midi;
+        var len = note.Length;
+        if (nibble1 == 0x8 && midi > 0)
+        {
+            rest = true;
+            freq = 0; // set frequency to 0 if this is a rest
+            midi = 0; // set MIDI note to 0 if this is a rest
+        }
+        var lenStr = GetNoteLengthName(len);
+        Console.WriteLine($"{note.Pos:x3} : {note.B:x2} {(len > 0 ? (rest ? "r" : midi > 0 ? GetNoteName(midi) : "") : midi > 0 ? "*" : "")}\t{lenStr}\tMIDI:{midi,3}\tFreq:{Math.Round(freq, 2),7}");
+        // Not polyphonic, play next track separately
+        if (note.Ch != ch)
+        {
+            ch = note.Ch;
+            Console.WriteLine("Channel " + ch);
+        }
+        if (!rest && note.Midi > 0 && note.Ch > 0)
+            midiOut.Send(MidiMessage.StartNote(note.Midi, 127, note.Ch).RawData);
+        Thread.Sleep(note.Length * delay);
+        if (!rest && note.Midi > 0 && note.Ch > 0)
+            midiOut.Send(MidiMessage.StopNote(note.Midi, 0, note.Ch).RawData);
+    }
+}
+
+void WriteMidi(int delay, List<(int Ch, int Pos, byte B, int Midi, double Freq, int Length)> notes, string filePath = "")
+{
+    var multiTrack = 0;
+    if (Path.GetExtension(filePath).Equals(".jr", StringComparison.OrdinalIgnoreCase))
+        multiTrack = 1;
+    IList<MidiEvent> track = [];
+
+    // TODO: Is this even in the ballpark?
+    const int TICKS = 4096;     // divide this by delay to get ticks per quarter note
+    const int DEF_VOL = 127;    // maximum velocity
+    var ch = 0;
+    long time = 0;
+
+    MidiEventCollection events = new(multiTrack, TICKS / delay);
+
+    foreach (var note in notes)
+    {
+        var nibble1 = (byte)((note.B & 0xF0) >> 4);
+        var nibble2 = (byte)((note.B & 0x0F) - 1);
+
+        var midi = note.Midi;
+        if (note.Ch != ch)
+        {
+            if (multiTrack == 1 && note.Ch < 17)
+            {
+                if (ch > 0)
+                    track.Add(new MetaEvent(MetaEventType.EndTrack, 0, time)); // end prior track
+                ch = note.Ch;
+                time = 0;
+                track = events.AddTrack([new PatchChangeEvent(0, ch, PATCH)]);
+            }
+            else
+                ch = 1;
+        }
+        if (midi > 0 && ch > 0)
+        {
+            if (nibble1 == 0x8)
+                time += note.Length * delay;
+            else
+            {
+                var duration = note.Length * delay;
+                track.Add(new NoteOnEvent(time, ch, midi, DEF_VOL, duration));
+                time += duration;
+                // note off
+                track.Add(new NoteOnEvent(time, ch, midi, 0, 0));
+                //track.Add(new NoteEvent(time, ch, MidiCommandCode.NoteOff, midi, 0));
+            }
+        }
+    }
+    track.Add(new MetaEvent(MetaEventType.EndTrack, 0, time));
+    if (ch == 1)
+        events.MidiFileType = 0;
+    events.PrepareForExport();
+    MidiFile.Export($"{filePath}.mid", events);
+}
+
+double GetFreqOffset(int n)
+{
+    return (n % 12) switch
+    {
+        -3 => 27.5000,   // A0
+        -2 => 29.1352,   // Bb0
+        -1 => 30.8677,   // B0
+        0 => 32.7032,   // C1
+        1 => 34.6478,   // C#1
+        2 => 36.7081,   // D1
+        3 => 38.8909,   // Eb1
+        4 => 41.2034,   // E1
+        5 => 43.6535,   // F1
+        6 => 46.2493,   // F#1
+        7 => 48.9994,   // G1
+        8 => 51.9131,   // G#1
+        9 => 55.0000,   // A1
+        10 => 58.2705,  // Bb1
+        11 => 61.7354,  // B1
+        //9 => 65.4064,   // C2
+        //10 => 69.2957,  // C#2
+        //11 => 73.4162,  // D2
+        _ => 0,
+    };
+}
+
+int GetMidiNote(byte b) // where e.g., 0xC2 -> 57 (A3)
+{
+    if (b >= FIRST_PITCH_BYTE)
+        return b - FIRST_PITCH_BYTE + FIRST_MIDI;
+    return FIRST_MIDI;
+}
+
+double GetFreq(int midi)
+{
+    var offset = midi - FIRST_MIDI - 3;  // Need to go to the previous A note
+    var oct = offset / 12 + FIRST_OCTAVE;
+    return GetFreqOffset(offset) * Math.Pow(2, oct);
+}
+
+string GetNoteName(int midi) // where 57 -> A3 (0xC2)
+{
+    var offset = midi - FIRST_MIDI - 3;  // Need to go to the previous A note
+    var oct = offset / 12 + FIRST_OCTAVE;
+    if (oct == FIRST_OCTAVE && offset < 0)
+        oct--;
+    return (offset % 12) switch
+    {
+        -3 => "A" + oct,
+        -2 => "Bb" + oct,
+        -1 => "B" + oct,
+        0 => "C" + oct,
+        1 => "C#" + oct,
+        2 => "D" + oct,
+        3 => "Eb" + oct,
+        4 => "E" + oct,
+        5 => "F" + oct,
+        6 => "F#" + oct,
+        7 => "G" + oct,
+        8 => "G#" + oct,
+        9 => "A" + oct,
+        10 => "Bb" + oct,
+        11 => "B" + oct,
+        _ => "-" + oct,
+    };
+}
+
+string GetNoteLengthName(int len, string last = "")
+{
+    return (len) switch
+    {
+        <1 => "",
+        2 => last != " 1/8" ? " 1/8" : "",
+        4 => last != " 1/4" ? " 1/4" : "",
+        6 => last != " 3/8" ? " 3/8" : "",
+        8 => last != " 1/2" ? " 1/2" : "",
+        10 => last != " 5/8" ? " 5/8" : "",
+        12 => last != " 3/4" ? " 3/4" : "",
+        14 => last != " 7/8" ? " 7/8" : "",
+        16 => last != " 1" ? " 1" : "",
+        32 => last != " 2" ? " 2" : "",
+        48 => last != " 3" ? " 3" : "",
+        64 => last != " 4" ? " 4" : "",
+        80 => last != " 5" ? " 5" : "",
+        96 => last != " 6" ? " 6" : "",
+        112 => last != " 7" ? " 7" : "",
+        128 => last != " 8" ? " 8" : "",
+        _ => last != $" {len}/16" ? $" {len}/16" : "",
+    };
+}
+
+// The PC Speaker was monophonic, and the PCjr was quadraphonic (though these games only uses the 3 waveform channels; the fourth noise channel isn't used)
+void PlaySound(string abbrev, string filePath = "", bool toFile = false)
+{
+    bool pitch = false;
+    byte origPitch = 0x0;
+    byte oldPitch = 0x0;
+    byte newPitch = 0x0;
+    var midi = 0;
+    double freq = 0f;
+    var delay = 48;
+    var channel = 0;
+    bool noNote = true;
+    byte[] array = [];
+    List<int> lengths = [];
+    List<(int Ch, int Pos, byte B, int Midi, double Freq, int Length)> notes = [];
+    try
+    {
+        if (!File.Exists(filePath))
+        {
+            Console.Error.WriteLine($"Error: File not found: {filePath}");
+            return;
+        }
+        array = File.ReadAllBytes(filePath);
+    }
+    catch (Exception) { }
+
+    int i = 0;
+    if (!toFile)
+    {
+        Console.WriteLine("Off | 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F");
+        Console.Write("----+------------------------------------------------");
+    }
+    foreach (var b in array)
+    {
+        pitch = false;
+        if (i == 0x02)
+            delay = b * 16;             // beat time length
+        else if (i > 0x0A && i < 0x1A)  // note lengths
+            lengths.Add(b);
+        else if (i > 0x19)              // note data
+        {
+            var len = 0;
+            var nibble1 = (byte)((b & 0xF0) >> 4);
+            var nibble2 = (byte)((b & 0x0F) - 1);
+
+            if (b == 0x00 || b == 0x40 || b == 0x50 || b == 0x80)
+                noNote = true;
+            else if (noNote == true && b == 0x08)
+            {
+                channel++;
+                if (channel == 10) // don't use percussion channel
+                    channel++;
+            }
+            else if (noNote == true && b >= FIRST_PITCH_BYTE)
+            {
+                noNote = false;
+                pitch = true;
+                midi = GetMidiNote(b);
+                if (midi < FIRST_MIDI)
+                    midi = FIRST_MIDI;
+                freq = GetFreq(midi);
+                origPitch = b;
+                oldPitch = b;
+            }
+            else
+            {
+                noNote = false;
+                if ((nibble1 & 0x08) == 0)  // positive nibble
+                {
+                    newPitch = (byte)(oldPitch + nibble1);
+                    midi += nibble1;
+                    if (midi > LAST_MIDI)
+                        midi = LAST_MIDI;
+                    freq = GetFreq(midi);
+                    oldPitch = newPitch;
+                }
+                else if (nibble1 > 0x8)     // negative nibble
+                {
+                    // F:-1, E:-2, D:-3, C:-4, B:-5, A:-6, 9:-7
+                    newPitch = (byte)(oldPitch - (0xF - nibble1 + 1));
+                    midi -= 0xF - nibble1 + 1;
+                    oldPitch = newPitch;
+                    if (midi < FIRST_MIDI)
+                        midi = FIRST_MIDI;
+                    freq = GetFreq(midi);
+                }
+                else //if (nibble1 == 0x8)  // rest
+                    newPitch = oldPitch;
+
+                if (nibble2 >= 0 && nibble2 < lengths.Count)
+                    len = lengths[nibble2];
+            }
+            if (!noNote || pitch)
+                notes.Add((channel, i, b, midi, freq, len));
+            else
+                notes.Add((channel, i, b, 0, 0, 0));
+        }
+
+        if (!toFile)
+        {
+            if (i % 16 == 0)
+            {
+                Console.WriteLine();
+                Console.Write($"{i:x3} | ");
+            }
+            Console.Write($"{b:x2} ");
+#if DEBUG
+            if (i == 0x02)
+            {
+                Console.WriteLine();
+                Console.WriteLine($"      [delay: {delay}]");
+                Console.Write("000 | -- -- -- ");
+            }
+            else if (i == 0x19)
+            {
+                Console.WriteLine();
+                Console.Write($"      [lengths: ");
+                foreach (var len in lengths)
+                {
+                    Console.Write(len + ",");
+                }
+                Console.WriteLine("]");
+                Console.Write("010 | -- -- -- -- -- -- -- -- -- -- ");
+            }
+#endif
+        }
+        i++;
+    }
+
+    if (toFile)
+    {
+        WriteMidi(delay, notes, filePath);
+        return;
+    }
+
+    Console.WriteLine();
+    Console.WriteLine(divider);
+    MidiOut(delay, notes);
+    Console.WriteLine(divider);
+    return;
+}
+
+// The CGA medium-resolution graphics mode used here for PC is 320x200 x 4-color, with 2 possible palettes in mode 4
+void DrawPic(string abbrev, string filePath = "", bool toFile = false)
+{
+    byte OFFSET = 0x06; // The first 6 bytes have palette colors and height/width
     ushort x = 0, y = 0, w = 0, h = 0, palette = 0;
     byte[] array = [];
     Console.Clear();
@@ -661,7 +1213,7 @@ void Draw(string abbrev, string filePath = "", bool toFile = false)
     {
         if (!File.Exists(filePath))
         {
-            Console.Error.WriteLine("Error: File not found!");
+            Console.Error.WriteLine($"Error: File not found: {filePath}");
             return;
         }
         array = File.ReadAllBytes(filePath);
@@ -824,10 +1376,11 @@ void DoExit(string error = "")
 ConsoleKey? ShowMenu(bool main, string title, params string[] options)
 {
     ConsoleKeyInfo? key = null;
-    while (key?.Key != keyEsc && key?.Key != keyBack && key?.Key != keyQuit && key?.Key != keyExport &&
-           key?.Key != key1 && key?.Key != key2 && key?.Key != key3 &&
-           key?.Key != key4 && key?.Key != key5 && key?.Key != key6 &&
-           key?.Key != key7 && key?.Key != key8 && key?.Key != key9)
+    while (key?.Key != keyEsc && key?.Key != keyBack && key?.Key != keyQuit &&
+           key?.Key != keySwitch && key?.Key != keyExpPng && key?.Key != keyExpMid &&
+           key?.Key != key0 && key?.Key != key1 && key?.Key != key2 && key?.Key != key3 &&
+           key?.Key != key4 && key?.Key != key5 && key?.Key != key6 && key?.Key != key7 &&
+           key?.Key != key8 && key?.Key != key9)
     {
         if (key is not null)
             Console.Error.WriteLine(keyError);
@@ -835,7 +1388,7 @@ ConsoleKey? ShowMenu(bool main, string title, params string[] options)
         Console.WriteLine(divider);
         Console.WriteLine();
         Console.WriteLine($"{titleDecor}{title}{titleDecor}");
-        var i = 1;
+        var i = 0;
         foreach (var option in options)
         {
             if (i < 10)
@@ -844,9 +1397,14 @@ ConsoleKey? ShowMenu(bool main, string title, params string[] options)
         }
         Console.WriteLine();
         if (main)
-            Console.WriteLine($" X. {exportMenu}");
+        {
+            Console.WriteLine($" S. {switchMenu} ({pcType}){expTag}");
+            Console.WriteLine($" P. {exportPngMenu}");
+            Console.WriteLine($" M. {exportMidMenu}{expTag}");
+        }
         else
             Console.WriteLine($" B. {backMenu}");
+
         Console.WriteLine($" Q. {quitMenu}");
         Console.WriteLine();
         Console.Write(prompt);
@@ -862,36 +1420,41 @@ void DoMainMenu()
 {
     while (true)
     {
-    var key = ShowMenu(main: true, title: mainTitle, amazonName, dragonName, f451Name, amberName, perryName, ramaName, islandName, ozName);
-
+        var key = ShowMenu(main: true, title: mainTitle, amazonName, dragonName, f451Name, amberName, perryName, ramaName, islandName, ozName);
         switch (key)
         {
-            case key1:
+            case key0:
                 DoAmazonMenu();
                 break;
-            case key2:
+            case key1:
                 DoDragonMenu();
                 break;
-            case key3:
+            case key2:
                 DoF451Menu();
                 break;
-            case key4:
+            case key3:
                 DoAmberMenu();
                 break;
-            case key5:
+            case key4:
                 DoPerryMenu();
                 break;
-            case key6:
+            case key5:
                 DoRamaMenu();
                 break;
-            case key7:
+            case key6:
                 DoIslandMenu();
                 break;
-            case key8:
+            case key7:
                 DoOzMenu();
                 break;
-            case keyExport:
+            case keySwitch:
+                DoSwitchMenu();
+                break;
+            case keyExpPng:
                 ExportPicFiles();
+                break;
+            case keyExpMid:
+                ExportSndFiles();
                 break;
             case keyBack:
             case keyQuit:
@@ -910,36 +1473,35 @@ void DoAmazonMenu()
     while (true)
     {
         var key = ShowMenu(main: false, title: amazonTitle, amazonMenu1, amazonMenu2, amazonMenu3, picMenu, sndMenu, strMenu);
-
         switch (key)
         {
-            case key1:
+            case key0:
                 Console.WriteLine(amazonMenu1);
                 ShowExe(amazonAbb, null, null);
                 break;
-            case key2:
+            case key1:
                 Console.WriteLine(amazonMenu2);
                 ShowVocab(amazonAbb);
                 break;
-            case key3:
+            case key2:
                 Console.WriteLine(amazonMenu3);
                 ShowLocs(amazonAbb);
                 break;
             /*
-            case key3:
+            case key2:
                 Console.WriteLine(amazonMenu3);
                 ShowFunctions(amazonAbb);
                 break;
             */
-            case key4:
+            case key3:
                 Console.WriteLine(picMenu);
                 ShowPicFiles(amazonAbb);
                 break;
-            case key5:
+            case key4:
                 Console.WriteLine(sndMenu);
                 ShowSoundFiles(amazonAbb);
                 break;
-            case key6:
+            case key5:
                 Console.WriteLine(strMenu);
                 ShowStrings(amazonAbb, 0x03, expand: false);
                 break;
@@ -964,36 +1526,36 @@ void DoDragonMenu()
         var key = ShowMenu(main: false, title: dragonTitle, dragonMenu1, dragonMenu2, picMenu, sndMenu, strMenu);
         switch (key)
         {
-            case key1:
+            case key0:
                 Console.WriteLine(dragonMenu1);
                 ShowExe(dragonAbb,
                     [0x50, 0x57, 0xE8, 0xC9, 0xD2, 0x83, 0xC4, 0x06, 0x57, 0xE8, 0x3C, 0xDB, 0x59, 0x8B, 0xC7, 0xC3,
                     0x64, 0x67, 0x77], // "dgw"
                     [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
                 break;
-            case key2:
+            case key1:
                 Console.WriteLine(dragonMenu2);
                 ShowLocs(dragonAbb);
                 break;
             /*
-            case key3:
+            case key2:
                 Console.WriteLine(dragonMenu3);
                 ShowFunctions(dragonAbb);
                 break;
-            case key4:
+            case key3:
                 Console.WriteLine(dragonMenu5);
                 ShowVocab(dragonAbb);
                 break;
             */
-            case key3:
+            case key2:
                 Console.WriteLine(picMenu);
                 ShowPicFiles(dragonAbb);
                 break;
-            case key4:
+            case key3:
                 Console.WriteLine(sndMenu);
                 ShowSoundFiles(dragonAbb);
                 break;
-            case key5:
+            case key4:
                 Console.WriteLine(strMenu);
                 ShowStrings(dragonAbb, 0x03, expand: false);
                 break;
@@ -1018,33 +1580,33 @@ void DoF451Menu()
         var key = ShowMenu(main: false, title: f451Title, f451Menu1, f451Menu2, f451Menu3, picMenu, sndMenu, strMenu);
         switch (key)
         {
-            case key1:
+            case key0:
                 Console.WriteLine(f451Menu1);
                 ShowLocs(f451Abb);
                 break;
-            case key2:
+            case key1:
                 Console.WriteLine(f451Menu2);
                 ShowExe(f451Abb, null, null);
                 break;
-            case key3:
+            case key2:
                 Console.WriteLine(f451Menu3);
                 ShowVocab(f451Abb);
                 break;
             /*
-            case key3:
+            case key2:
                 Console.WriteLine(f451Menu3);
                 ShowFunctions(f451Abb);
                 break;
             */
-            case key4:
+            case key3:
                 Console.WriteLine(picMenu);
                 ShowPicFiles(f451Abb);
                 break;
-            case key5:
+            case key4:
                 Console.WriteLine(sndMenu);
                 ShowSoundFiles(f451Abb);
                 break;
-            case key6:
+            case key5:
                 Console.WriteLine(strMenu);
                 ShowStrings(f451Abb, 0x03, expand: false);
                 break;
@@ -1069,37 +1631,37 @@ void DoAmberMenu()
         var key = ShowMenu(main: false, title: amberTitle, amberMenu1, amberMenu2, amberMenu3, amberMenu4, amberMenu5, picMenu, sndMenu, strExpMenu);
         switch (key)
         {
-            case key1:
+            case key0:
                 Console.WriteLine(amberMenu1);
                 ShowLocs(amberAbb);
                 break;
-            case key2:
+            case key1:
                 Console.WriteLine(amberMenu2);
                 ShowExe(amberAbb,
                     [0x61, 0x6D, 0x62, 0x2E, 0x20, 0x20, 0x20],                     // start: "amb.   "
                     [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
                 break;
-            case key3:
+            case key2:
                 Console.WriteLine(amberMenu3);
                 ShowFunctions(amberAbb);
                 break;
-            case key4:
+            case key3:
                 Console.WriteLine(amberMenu4);
                 ShowTokens(amberAbb);
                 break;
-            case key5:
+            case key4:
                 Console.WriteLine(amberMenu5);
                 ShowVocab(amberAbb);
                 break;
-            case key6:
+            case key5:
                 Console.WriteLine(picMenu);
                 ShowPicFiles(amberAbb);
                 break;
-            case key7:
+            case key6:
                 Console.WriteLine(sndMenu);
                 ShowSoundFiles(amberAbb);
                 break;
-            case key8:
+            case key7:
                 Console.WriteLine(strExpMenu);
                 ShowStrings(amberAbb, 0x02, expand: true);
                 break;
@@ -1124,31 +1686,31 @@ void DoPerryMenu()
         var key = ShowMenu(main: false, title: perryTitle, perryMenu1, perryMenu2, perryMenu3, perryMenu4, picMenu, sndMenu, strMenu);
         switch (key)
         {
-            case key1:
+            case key0:
                 Console.WriteLine(perryMenu1);
                 ShowLocs(perryAbb);
                 break;
-            case key2:
+            case key1:
                 Console.WriteLine(perryMenu2);
                 ShowExe(perryAbb, null, null);
                 break;
-            case key3:
+            case key2:
                 Console.WriteLine(perryMenu3);
                 ShowFunctions(perryAbb);
                 break;
-            case key4:
+            case key3:
                 Console.WriteLine(perryMenu4);
                 ShowVocab(perryAbb);
                 break;
-            case key5:
+            case key4:
                 Console.WriteLine(picMenu);
                 ShowPicFiles(perryAbb);
                 break;
-            case key6:
+            case key5:
                 Console.WriteLine(sndMenu);
                 ShowSoundFiles(perryAbb);
                 break;
-            case key7:
+            case key6:
                 Console.WriteLine(strMenu);
                 ShowStrings(perryAbb, 0x03, expand: false);
                 break;
@@ -1173,33 +1735,33 @@ void DoRamaMenu()
         var key = ShowMenu(main: false, title: ramaTitle, ramaMenu1, ramaMenu2, picMenu, sndMenu, strMenu);
         switch (key)
         {
-            case key1:
+            case key0:
                 Console.WriteLine(ramaMenu1);
                 ShowLocs(ramaAbb);
                 break;
-            case key2:
+            case key1:
                 Console.WriteLine(ramaMenu2);
                 ShowExe(ramaAbb, null, null);
                 break;
             /*
-            case key3:
+            case key2:
                 Console.WriteLine(ramaMenu3);
                 ShowFunctions(ramaAbb);
                 break;
-            case key4:
+            case key3:
                 Console.WriteLine(ramaMenu5);
                 ShowVocab(ramaAbb);
                 break;
             */
-            case key3:
+            case key2:
                 Console.WriteLine(picMenu);
                 ShowPicFiles(ramaAbb);
                 break;
-            case key4:
+            case key3:
                 Console.WriteLine(sndMenu);
                 ShowSoundFiles(ramaAbb);
                 break;
-            case key5:
+            case key4:
                 Console.WriteLine(strMenu);
                 ShowStrings(ramaAbb, 0x03, expand: false);
                 break;
@@ -1224,33 +1786,33 @@ void DoIslandMenu()
         var key = ShowMenu(main: false, title: islandTitle, islandMenu1, islandMenu2, islandMenu3, picMenu, sndMenu, strMenu);
         switch (key)
         {
-            case key1:
+            case key0:
                 Console.WriteLine(islandMenu1);
                 ShowLocs(islandAbb);
                 break;
-            case key2:
+            case key1:
                 Console.WriteLine(islandMenu2);
                 ShowExe(islandAbb, null, null);
                 break;
-            case key3:
+            case key2:
                 Console.WriteLine(islandMenu3);
                 ShowVocab(islandAbb);
                 break;
             /*
-            case key3:
+            case key2:
                 Console.WriteLine(islandMenu3);
                 ShowFunctions(islandAbb);
                 break;
             */
-            case key4:
+            case key3:
                 Console.WriteLine(picMenu);
                 ShowPicFiles(islandAbb);
                 break;
-            case key5:
+            case key4:
                 Console.WriteLine(sndMenu);
                 ShowSoundFiles(islandAbb);
                 break;
-            case key6:
+            case key5:
                 Console.WriteLine(strMenu);
                 ShowStrings(islandAbb, 0x03, expand: false);
                 break;
@@ -1275,31 +1837,31 @@ void DoOzMenu()
         var key = ShowMenu(main: false, title: ozTitle, ozMenu1, ozMenu2, ozMenu3, ozMenu4, picMenu, sndMenu, strMenu);
         switch (key)
         {
-            case key1:
+            case key0:
                 Console.WriteLine(ozMenu1);
                 ShowLocs(ozAbb);
                 break;
-            case key2:
+            case key1:
                 Console.WriteLine(ozMenu2);
                 ShowExe(ozAbb, null, null);
                 break;
-            case key3:
+            case key2:
                 Console.WriteLine(ozMenu3);
                 ShowFunctions(ozAbb);
                 break;
-            case key4:
+            case key3:
                 Console.WriteLine(ozMenu4);
                 ShowVocab(ozAbb);
                 break;
-            case key5:
+            case key4:
                 Console.WriteLine(picMenu);
                 ShowPicFiles(ozAbb);
                 break;
-            case key6:
+            case key5:
                 Console.WriteLine(sndMenu);
                 ShowSoundFiles(ozAbb);
                 break;
-            case key7:
+            case key6:
                 Console.WriteLine(strMenu);
                 ShowStrings(ozAbb, 0x03, expand: false);
                 break;
@@ -1314,6 +1876,56 @@ void DoOzMenu()
         }
         if (key == keyBack || key == keyEsc)
             break;
+    }
+}
+
+void DoSwitchMenu()
+{
+    while (true)
+    {
+        var key = ShowMenu(main: false, title: switchMenu, apple2Type, atariStType, commodoreType, ibmType, macType, msxType);
+
+        switch (key)
+        {
+            case key0:
+                Console.WriteLine(apple2Type);
+                pcType = apple2Abb;
+                break;
+            case key1:
+                Console.WriteLine(atariStType);
+                pcType = atariStAbb;
+                break;
+            case key2:
+                Console.WriteLine(commodoreType);
+                pcType = commodoreAbb;
+                break;
+            case key3:
+                Console.WriteLine(ibmType);
+                pcType = ibmAbb;
+                break;
+            case key4:
+                Console.WriteLine(macType);
+                pcType = macAbb;
+                break;
+            case key5:
+                Console.WriteLine(msxType);
+                pcType = msxAbb;
+                break;
+            case keyBack:
+            case keyEsc:
+                break;
+            case keyQuit:
+                DoExit();
+                break;
+            default:
+                break;
+        }
+        if (key == key0 || key == key1 || key == key2 || key == key3 || key == key4 || key == key5 ||
+            //key == key6 || key == key7 || key == key8 || key == key9
+            key == keyBack || key == keyEsc)
+        {
+            break;
+        }
     }
 }
 
